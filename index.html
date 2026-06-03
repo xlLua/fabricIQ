@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>fabricIQ Dashboard</title>
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.75.0/build/style.css"
+  />
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdn.jsdelivr.net/npm/@stlite/browser@0.75.0/build/stlite.js"></script>
+  <script>
+    stlite.mount(
+      {
+        requirements: ["pandas", "plotly"],
+        entrypoint: "app.py",
+        files: {
+          "app.py":            { url: "./app.py" },
+          "DimProducts.csv":   { url: "./DimProducts.csv" },
+          "DimStore.csv":      { url: "./DimStore.csv" },
+          "Freezer.csv":       { url: "./Freezer.csv" },
+          "FactSales.csv":     { url: "./FactSales.csv" },
+          "FreezerTelemetry.csv": { url: "./FreezerTelemetry.csv" },
+        },
+      },
+      document.getElementById("root")
+    );
+  </script>
+</body>
+</html>
