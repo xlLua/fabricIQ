@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+import networkx as nx
 
 st.set_page_config(
     page_title="fabricIQ Dashboard",
@@ -270,6 +272,219 @@ def render_store_performance(fdf: pd.DataFrame, stores_df: pd.DataFrame) -> None
         st.plotly_chart(fig, use_container_width=True)
 
 
+# ── Relationship graph ────────────────────────────────────────────────────────
+
+NODE_COLORS = {
+    "store": "#1f77b4",          # blue
+    "product": "#2ca02c",        # green
+    "freezer_ok": "#17becf",     # teal
+    "freezer_alert": "#d62728",  # red
+}
+
+
+def _scale(values, lo: float, hi: float) -> pd.Series:
+    """Min-max scale a numeric sequence into [lo, hi]; constant input -> midpoint."""
+    s = pd.Series(list(values), dtype="float64")
+    if s.empty:
+        return s
+    mn, mx = s.min(), s.max()
+    if mx == mn:
+        return pd.Series([(lo + hi) / 2] * len(s), index=s.index)
+    return lo + (s - mn) / (mx - mn) * (hi - lo)
+
+
+def _layered_layout(G: "nx.Graph") -> dict:
+    """Deterministic columnar layout: products | stores | freezers."""
+    cols = {"product": -1.0, "store": 0.0, "freezer_ok": 1.0, "freezer_alert": 1.0}
+    buckets: dict = {}
+    for n, d in G.nodes(data=True):
+        x = cols.get(d["ntype"], 0.0)
+        buckets.setdefault(x, []).append(n)
+    pos = {}
+    for x, nodes in buckets.items():
+        nodes = sorted(nodes)
+        n = len(nodes)
+        for i, node in enumerate(nodes):
+            y = 0.5 if n == 1 else i / (n - 1)
+            pos[node] = (x, y)
+    return pos
+
+
+def render_relationship_graph(fdf, ftdf, stores, freezers, products) -> None:
+    st.subheader("Relationship Graph")
+
+    c1, c2, c3 = st.columns([1.3, 1, 2])
+    with c1:
+        layout_mode = st.radio("Layout", ["Layered", "Radial"], horizontal=True)
+    with c2:
+        show_freezers = st.checkbox("Show freezers", value=True)
+
+    # Aggregations (reuse the same groupby idioms as the chart sections)
+    store_rev = (
+        fdf.groupby(["StoreId", "StoreName", "City"])
+        .agg(Rev=("RevenueUSD", "sum"), Units=("Units", "sum"))
+        .reset_index()
+    )
+    prod_rev = (
+        fdf.groupby(["ProductId", "ProductName", "Category"])
+        .agg(Rev=("RevenueUSD", "sum"), Units=("Units", "sum"))
+        .reset_index()
+    )
+    sp = fdf.groupby(["StoreId", "ProductId"])["RevenueUSD"].sum().reset_index()
+
+    max_edge = int(sp["RevenueUSD"].max()) if not sp.empty else 0
+    with c3:
+        if max_edge > 0:
+            min_edge_rev = st.slider(
+                "Min sales-edge revenue ($)", 0, max_edge, 0,
+                step=max(1, max_edge // 50),
+            )
+        else:
+            min_edge_rev = 0
+    sp = sp[sp["RevenueUSD"] >= min_edge_rev]
+
+    # Freezers in the selected stores + alert status from telemetry
+    sel_store_ids = set(store_rev["StoreId"])
+    fz = freezers[freezers["StoreId"].isin(sel_store_ids)].copy()
+    if not ftdf.empty:
+        fz_alerts = (
+            ftdf.groupby("FreezerId")
+            .agg(Readings=("temperatureC", "count"),
+                 Alerts=("temperatureC", lambda x: (x > SAFE_TEMP).sum()))
+            .reset_index()
+        )
+        fz = fz.merge(fz_alerts, on="FreezerId", how="left")
+    if "Readings" not in fz.columns:
+        fz["Readings"] = 0
+        fz["Alerts"] = 0
+    fz[["Readings", "Alerts"]] = fz[["Readings", "Alerts"]].fillna(0)
+
+    # Build graph
+    G = nx.Graph()
+    for (_, row), sz in zip(store_rev.iterrows(), _scale(store_rev["Rev"], 22, 55)):
+        G.add_node(
+            f"S::{row.StoreId}", ntype="store",
+            label=row.StoreName.replace("Lakeshore Retail ", ""), size=sz,
+            hover=(f"🏪 <b>{row.StoreName}</b><br>City: {row.City}"
+                   f"<br>Revenue: ${row.Rev:,.0f}<br>Units: {int(row.Units):,}"),
+        )
+    for (_, row), sz in zip(prod_rev.iterrows(), _scale(prod_rev["Rev"], 18, 50)):
+        G.add_node(
+            f"P::{row.ProductId}", ntype="product", label=row.ProductName, size=sz,
+            hover=(f"🍦 <b>{row.ProductName}</b><br>Category: {row.Category}"
+                   f"<br>Revenue: ${row.Rev:,.0f}<br>Units: {int(row.Units):,}"),
+        )
+    if show_freezers:
+        for _, row in fz.iterrows():
+            alert = row.Alerts > 0
+            comp = (1 - row.Alerts / row.Readings) * 100 if row.Readings else 100.0
+            G.add_node(
+                f"F::{row.FreezerId}",
+                ntype="freezer_alert" if alert else "freezer_ok",
+                label=row.FreezerId, size=16,
+                hover=(f"🧊 <b>{row.FreezerId}</b><br>Model: {row.Model}"
+                       f"<br>Compliance: {comp:.1f}%"
+                       f"<br>Status: {'⚠️ ALERT' if alert else '✅ OK'}"),
+            )
+
+    for _, row in sp.iterrows():
+        s_nid, p_nid = f"S::{row.StoreId}", f"P::{row.ProductId}"
+        if G.has_node(s_nid) and G.has_node(p_nid):
+            G.add_edge(s_nid, p_nid, weight=float(row.RevenueUSD), etype="sales")
+    if show_freezers:
+        for _, row in fz.iterrows():
+            s_nid, f_nid = f"S::{row.StoreId}", f"F::{row.FreezerId}"
+            if G.has_node(s_nid) and G.has_node(f_nid):
+                G.add_edge(s_nid, f_nid, weight=1.0, etype="contains")
+
+    if G.number_of_nodes() == 0:
+        st.info("No entities match the current filters.")
+        return
+
+    # The sales subgraph is complete bipartite (every store sells every product), so a
+    # force-directed layout collapses the core into a blob. Layered (columns) and Radial
+    # (concentric rings by type) both place nodes deterministically and stay readable.
+    if layout_mode == "Radial":
+        rings = [
+            [n for n, d in G.nodes(data=True) if d["ntype"] == "store"],
+            [n for n, d in G.nodes(data=True) if d["ntype"] == "product"],
+            [n for n, d in G.nodes(data=True)
+             if d["ntype"] in ("freezer_ok", "freezer_alert")],
+        ]
+        rings = [r for r in rings if r]
+        pos = nx.shell_layout(G, nlist=rings)
+    else:
+        pos = _layered_layout(G)
+
+    fig = go.Figure()
+
+    # Sales edges — per-edge so width/opacity can vary with revenue
+    sales_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d["etype"] == "sales"]
+    if sales_edges:
+        weights = [d["weight"] for _, _, d in sales_edges]
+        wmin, wmax = min(weights), max(weights)
+        for (u, v, d), w in zip(sales_edges, _scale(weights, 1.0, 8.0)):
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            op = (0.25 + 0.55 * (d["weight"] - wmin) / (wmax - wmin)) if wmax > wmin else 0.6
+            fig.add_trace(go.Scatter(
+                x=[x0, x1], y=[y0, y1], mode="lines",
+                line=dict(width=float(w), color=f"rgba(120,120,120,{op:.2f})"),
+                hoverinfo="skip", showlegend=False,
+            ))
+
+    # Containment edges — uniform dotted, single trace
+    cx, cy = [], []
+    for u, v, d in G.edges(data=True):
+        if d["etype"] == "contains":
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            cx += [x0, x1, None]
+            cy += [y0, y1, None]
+    if cx:
+        fig.add_trace(go.Scatter(
+            x=cx, y=cy, mode="lines",
+            line=dict(width=1, color="rgba(150,150,200,0.5)", dash="dot"),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    # Node traces, one per type (clean legend that doubles as compliance key)
+    trace_specs = [("store", "🏪 Store", NODE_COLORS["store"]),
+                   ("product", "🍦 Product", NODE_COLORS["product"])]
+    if show_freezers:
+        trace_specs += [("freezer_ok", "🧊 Freezer OK", NODE_COLORS["freezer_ok"]),
+                        ("freezer_alert", "⚠️ Freezer Alert", NODE_COLORS["freezer_alert"])]
+    for ntype, legend, color in trace_specs:
+        nodes = [n for n, dd in G.nodes(data=True) if dd["ntype"] == ntype]
+        if not nodes:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[pos[n][0] for n in nodes], y=[pos[n][1] for n in nodes],
+            mode="markers+text",
+            marker=dict(size=[G.nodes[n]["size"] for n in nodes], color=color,
+                        line=dict(width=1, color="white")),
+            text=[G.nodes[n]["label"] for n in nodes],
+            textposition="top center", textfont=dict(size=9),
+            hovertext=[G.nodes[n]["hover"] for n in nodes],
+            hoverinfo="text", name=legend,
+        ))
+
+    fig.update_layout(
+        title="Store ↔ Product ↔ Freezer Network",
+        height=650, hovermode="closest",
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Node size ∝ revenue. Grey edges = sales (thickness & opacity ∝ revenue); "
+        "dotted edges = freezer-in-store. Drag the slider to hide low-revenue sales links. "
+        "**Layered** reads products | stores | freezers as columns; **Radial** rings them "
+        "stores → products → freezers from the centre out."
+    )
+
+
 def render_product_analytics(fdf: pd.DataFrame) -> None:
     st.subheader("Product Analytics")
     tab_top, tab_pie, tab_scatter = st.tabs(
@@ -473,6 +688,8 @@ def main() -> None:
     render_sales_trends(fdf)
     st.divider()
     render_store_performance(fdf, stores)
+    st.divider()
+    render_relationship_graph(fdf, ftdf, stores, freezers, products)
     st.divider()
     render_product_analytics(fdf)
     st.divider()
