@@ -1,3 +1,5 @@
+import hashlib
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -401,6 +403,30 @@ def render_relationship_graph(fdf, ftdf, stores, freezers, products) -> None:
         st.info("No entities match the current filters.")
         return
 
+    # ── Selection state ───────────────────────────────────────────────────────
+    # Filter-aware key: embedding a hash of the current node set means any filter
+    # change yields a fresh widget, so a selection on a now-filtered node drops
+    # automatically. Deterministic hashlib hash (not Python's salted hash) so the
+    # key is stable across reruns and inside the WASM runtime.
+    node_sig = hashlib.md5("|".join(sorted(G.nodes)).encode()).hexdigest()[:8]
+    nonce = st.session_state.get("relgraph_nonce", 0)
+    chart_key = f"relgraph_{node_sig}_{nonce}"
+
+    selected_node = None
+    sel = st.session_state.get(chart_key)
+    if sel and sel.get("selection", {}).get("points"):
+        for p in sel["selection"]["points"]:
+            cd = p.get("customdata")
+            cd = cd[0] if isinstance(cd, (list, tuple)) else cd
+            if cd in G:  # validate against the current filtered graph
+                selected_node = cd
+                break
+
+    # None => no selection => render exactly as before (no dimming)
+    keep = (None if selected_node is None
+            else {selected_node} | set(G.neighbors(selected_node)))
+
+    # ── Layout ────────────────────────────────────────────────────────────────
     # The sales subgraph is complete bipartite (every store sells every product), so a
     # force-directed layout collapses the core into a blob. Layered (columns) and Radial
     # (concentric rings by type) both place nodes deterministically and stay readable.
@@ -418,7 +444,8 @@ def render_relationship_graph(fdf, ftdf, stores, freezers, products) -> None:
 
     fig = go.Figure()
 
-    # Sales edges — per-edge so width/opacity can vary with revenue
+    # Sales edges — per-edge so width/opacity can vary with revenue; when a node is
+    # selected, incident edges keep their colour and the rest fade out.
     sales_edges = [(u, v, d) for u, v, d in G.edges(data=True) if d["etype"] == "sales"]
     if sales_edges:
         weights = [d["weight"] for _, _, d in sales_edges]
@@ -426,29 +453,45 @@ def render_relationship_graph(fdf, ftdf, stores, freezers, products) -> None:
         for (u, v, d), w in zip(sales_edges, _scale(weights, 1.0, 8.0)):
             x0, y0 = pos[u]
             x1, y1 = pos[v]
-            op = (0.25 + 0.55 * (d["weight"] - wmin) / (wmax - wmin)) if wmax > wmin else 0.6
+            incident = keep is not None and selected_node in (u, v)
+            if keep is not None and not incident:
+                color = "rgba(200,200,200,0.05)"
+            else:
+                op = (0.25 + 0.55 * (d["weight"] - wmin) / (wmax - wmin)) if wmax > wmin else 0.6
+                color = f"rgba(120,120,120,{op:.2f})"
             fig.add_trace(go.Scatter(
                 x=[x0, x1], y=[y0, y1], mode="lines",
-                line=dict(width=float(w), color=f"rgba(120,120,120,{op:.2f})"),
+                line=dict(width=float(w), color=color),
                 hoverinfo="skip", showlegend=False,
             ))
 
-    # Containment edges — uniform dotted, single trace
-    cx, cy = [], []
-    for u, v, d in G.edges(data=True):
-        if d["etype"] == "contains":
+    # Containment edges — dotted; split into incident/faint when a node is selected
+    contain_edges = [(u, v) for u, v, d in G.edges(data=True) if d["etype"] == "contains"]
+
+    def _contain_trace(edges, color):
+        cx, cy = [], []
+        for u, v in edges:
             x0, y0 = pos[u]
             x1, y1 = pos[v]
             cx += [x0, x1, None]
             cy += [y0, y1, None]
-    if cx:
-        fig.add_trace(go.Scatter(
-            x=cx, y=cy, mode="lines",
-            line=dict(width=1, color="rgba(150,150,200,0.5)", dash="dot"),
-            hoverinfo="skip", showlegend=False,
-        ))
+        return go.Scatter(x=cx, y=cy, mode="lines",
+                          line=dict(width=1, color=color, dash="dot"),
+                          hoverinfo="skip", showlegend=False)
 
-    # Node traces, one per type (clean legend that doubles as compliance key)
+    if contain_edges:
+        if keep is None:
+            fig.add_trace(_contain_trace(contain_edges, "rgba(150,150,200,0.5)"))
+        else:
+            inc = [(u, v) for u, v in contain_edges if selected_node in (u, v)]
+            rest = [(u, v) for u, v in contain_edges if selected_node not in (u, v)]
+            if rest:
+                fig.add_trace(_contain_trace(rest, "rgba(150,150,200,0.06)"))
+            if inc:
+                fig.add_trace(_contain_trace(inc, "rgba(120,120,200,0.9)"))
+
+    # Node traces, one per type (clean legend that doubles as compliance key).
+    # Per-point opacity/line arrays dim non-neighbours and ring the clicked node.
     trace_specs = [("store", "🏪 Store", NODE_COLORS["store"]),
                    ("product", "🍦 Product", NODE_COLORS["product"])]
     if show_freezers:
@@ -458,13 +501,21 @@ def render_relationship_graph(fdf, ftdf, stores, freezers, products) -> None:
         nodes = [n for n, dd in G.nodes(data=True) if dd["ntype"] == ntype]
         if not nodes:
             continue
+        on = [keep is None or n in keep for n in nodes]
         fig.add_trace(go.Scatter(
             x=[pos[n][0] for n in nodes], y=[pos[n][1] for n in nodes],
             mode="markers+text",
-            marker=dict(size=[G.nodes[n]["size"] for n in nodes], color=color,
-                        line=dict(width=1, color="white")),
-            text=[G.nodes[n]["label"] for n in nodes],
+            marker=dict(
+                size=[G.nodes[n]["size"] for n in nodes], color=color,
+                opacity=[1.0 if o else 0.12 for o in on],
+                line=dict(
+                    width=[3 if n == selected_node else 1 for n in nodes],
+                    color=["#FFD700" if n == selected_node else "white" for n in nodes],
+                ),
+            ),
+            text=[G.nodes[n]["label"] if o else "" for n, o in zip(nodes, on)],
             textposition="top center", textfont=dict(size=9),
+            customdata=nodes,
             hovertext=[G.nodes[n]["hover"] for n in nodes],
             hoverinfo="text", name=legend,
         ))
@@ -476,12 +527,25 @@ def render_relationship_graph(fdf, ftdf, stores, freezers, products) -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=10, r=10, t=60, b=10),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=chart_key,
+                    on_select="rerun", selection_mode="points")
+
+    if selected_node is not None:
+        bcol, ccol = st.columns([1, 4])
+        with bcol:
+            if st.button("✖ Clear selection", use_container_width=True):
+                st.session_state["relgraph_nonce"] = nonce + 1
+                st.rerun()
+        with ccol:
+            st.caption(f"Highlighting **{G.nodes[selected_node]['label']}** and its "
+                       f"{len(keep) - 1} direct relationship(s).")
+
     st.caption(
         "Node size ∝ revenue. Grey edges = sales (thickness & opacity ∝ revenue); "
         "dotted edges = freezer-in-store. Drag the slider to hide low-revenue sales links. "
         "**Layered** reads products | stores | freezers as columns; **Radial** rings them "
-        "stores → products → freezers from the centre out."
+        "stores → products → freezers from the centre out. "
+        "**Click any node** to highlight its relationships."
     )
 
 
